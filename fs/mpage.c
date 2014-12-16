@@ -28,6 +28,8 @@
 #include <linux/backing-dev.h>
 #include <linux/pagevec.h>
 #include <linux/cleancache.h>
+#include <linux/dedup.h>
+#include <linux/swap.h>
 
 /*
  * I/O completion handler for multipage BIOs.
@@ -152,9 +154,10 @@ map_buffer_to_page(struct page *page, struct buffer_head *bh, int page_block)
  * get_block() call.
  */
 static struct bio *
-do_mpage_readpage(struct bio *bio, struct page *page, unsigned nr_pages,
-		sector_t *last_block_in_bio, struct buffer_head *map_bh,
-		unsigned long *first_logical_block, get_block_t get_block)
+do_mpage_readpage(struct bio *bio,
+		struct page *page, unsigned nr_pages, sector_t *last_block_in_bio,
+		struct buffer_head *map_bh,	unsigned long *first_logical_block,
+		get_block_t get_block)
 {
 	struct inode *inode = page->mapping->host;
 	const unsigned blkbits = inode->i_blkbits;
@@ -312,11 +315,105 @@ out:
 confused:
 	if (bio)
 		bio = mpage_bio_submit(READ, bio);
-	if (!PageUptodate(page))
-	        block_read_full_page(page, get_block);
+	if (!PageUptodate(page)) {
+		block_read_full_page(page, get_block);
+	}
 	else
 		unlock_page(page);
 	goto out;
+}
+
+int dedup_alloc_and_copy_page(struct page* p1, sector_t block1, struct page* p2){
+	//struct buffer_head* p1_bh;
+	//struct buffer_head *p2_bh = page_buffers(p2);
+	// Copy p2 into p1
+	//if (page_has_buffers(p1))
+	//		printk(KERN_ERR "not good, page has buffers...\n");
+	//else
+	//	create_empty_buffers(p1, dedup_get_block_size(), 0);
+	//page_cache_get(p1);
+	//memset(page_address(p1), 0, 10);//page_address(p2), PAGE_SIZE);
+	//page_cache_release(p1);
+	/*SetPageUptodate(p1);
+	// Create buffers to be mapped to p1
+	if (page_has_buffers(p1))
+		printk(KERN_ERR " not good, page has buffers...\n");
+	else
+		create_empty_buffers(p1, dedup_get_block_size(), 0);
+	// Update buffer's block
+	p1_bh = page_buffers(p1);
+
+	p1_bh->b_bdev = p2_bh->b_bdev;
+	p1_bh->b_blocknr = block1;
+	set_buffer_uptodate(p1_bh);
+	set_buffer_mapped(p1_bh);
+	SetPageMappedToDisk(p1);
+	// Update block's page inside dedup structure
+	dedup_update_block_page(p1);*/
+
+	return 1;
+}
+
+/**
+ *
+ */
+int dedup_get_duplicated_page(struct page *page)
+{
+	int ret = 0;
+	struct page *duplicated_page;
+	sector_t block_offset_in_page, curr_block;
+	sector_t *blocks;
+	int nr_blocks;
+
+	blocks = dedup_get_page_physical_blocks(page, &nr_blocks);
+	if (!blocks)
+		goto done_dedup;
+
+	// Todo: add support if there is more than 1 block in page - check them all
+	if (dedup_is_in_range(blocks[0]))
+		// Used for statistics - counts total reads
+		dedup_add_total_read();
+	else
+		goto done_dedup;
+
+	block_offset_in_page = 0;
+	curr_block = dedup_get_next_equal_block(blocks[block_offset_in_page]);
+	if (curr_block == blocks[block_offset_in_page])
+		goto done_dedup;
+
+	// Check first if the same block already read from device
+	do {
+		duplicated_page = dedup_get_block_page(curr_block);
+
+		// Check if we found the page should contain the duplicated block
+		if (duplicated_page) {
+			// TODO: we need to copy page content to avoid read from bdev
+			dedup_alloc_and_copy_page(page, blocks[block_offset_in_page], duplicated_page);
+
+			block_offset_in_page++;
+			if (block_offset_in_page < nr_blocks) {
+				curr_block = dedup_get_next_equal_block(blocks[block_offset_in_page]);
+			}
+		}
+		else {
+			// Try next duplicated block
+			curr_block = dedup_get_next_equal_block(curr_block);
+		}
+
+		if  (duplicated_page) {
+			page_cache_release(duplicated_page);
+		}
+	} while ((curr_block != blocks[block_offset_in_page]) &&
+			block_offset_in_page < nr_blocks);
+
+	if (block_offset_in_page == nr_blocks) {
+		dedup_add_equal_read();
+		//ret = 1;
+	}
+done_dedup:
+	if (blocks)
+		kfree(blocks);
+	return ret;
 }
 
 /**
@@ -379,13 +476,21 @@ mpage_readpages(struct address_space *mapping, struct list_head *pages,
 
 		prefetchw(&page->flags);
 		list_del(&page->lru);
-		if (!add_to_page_cache_lru(page, mapping,
-					page->index, GFP_KERNEL)) {
-			bio = do_mpage_readpage(bio, page,
-					nr_pages - page_idx,
-					&last_block_in_bio, &map_bh,
-					&first_logical_block,
-					get_block);
+		if (!add_to_page_cache_lru(page, mapping, page->index, GFP_KERNEL)) {
+			if (dedup_wait_for_init() || !dedup_get_duplicated_page(page))
+			{
+				bio = do_mpage_readpage(bio, page,
+						nr_pages - page_idx,
+						&last_block_in_bio, &map_bh,
+						&first_logical_block,
+						get_block);
+				dedup_update_block_page(page);
+			}
+			else
+			{
+				// TODO: remove...
+				printk(KERN_ERR "kululu duplicated found! :))))\n");
+			}
 		}
 		page_cache_release(page);
 	}

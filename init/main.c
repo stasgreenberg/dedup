@@ -74,6 +74,7 @@
 #include <linux/ptrace.h>
 #include <linux/blkdev.h>
 #include <linux/elevator.h>
+#include <linux/dedup.h>
 
 #include <asm/io.h>
 #include <asm/bugs.h>
@@ -99,6 +100,8 @@ static inline void mark_rodata_ro(void) { }
 #ifdef CONFIG_TC
 extern void tc_init(void);
 #endif
+
+extern int dedup_init(void);
 
 /*
  * Debug helper: via this flag we know that we are in 'early bootup code'
@@ -502,6 +505,7 @@ asmlinkage void __init start_kernel(void)
 	mm_init_owner(&init_mm, &init_task);
 	mm_init_cpumask(&init_mm);
 	setup_command_line(command_line);
+	dedup_init();		/* initizlize the dedup blocks array - using alloc_bootmem */
 	setup_nr_cpu_ids();
 	setup_per_cpu_areas();
 	smp_prepare_boot_cpu();	/* arch-specific boot-cpu hooks */

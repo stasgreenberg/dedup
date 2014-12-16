@@ -31,6 +31,7 @@
 #include <linux/delay.h>
 #include <linux/ratelimit.h>
 #include <linux/pm_runtime.h>
+#include <linux/dedup.h>
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/block.h>
@@ -1806,6 +1807,36 @@ void generic_make_request(struct bio *bio)
 	if (current->bio_list) {
 		bio_list_add(current->bio_list, bio);
 		return;
+	}
+
+	if (!dedup_wait_for_init() && (bio->bi_rw & WRITE)) {
+		sector_t changed_block = (unsigned long long)bio->bi_sector >> 3;
+
+		// Check if the block is in our dedup range
+		if (dedup_is_in_range(changed_block)) {
+			int i=0;
+			struct bio_vec *bvec;
+			char *p = (char*)kmalloc(dedup_get_block_size(), GFP_KERNEL);
+
+			printk("[%ld] [%llu] [%d] [%d] [%ld]\n",
+				bio->bi_sector,
+				(unsigned long long)bio->bi_sector >> 3,
+				bio_sectors(bio),
+				bio->bi_size,
+				bio_sector_offset(bio, bio_sectors(bio), 0));
+
+			// Go over each bio and update its block new data hash and crc
+			bio_for_each_segment_all(bvec, bio, i) {
+				char *addr = page_address(bvec->bv_page);
+				int len = bvec->bv_len;
+				memcpy(p, addr + bvec->bv_offset, len);
+
+				// TODO: use page_address instead of copying it - low priority
+				dedup_update_page_changed(changed_block + i, p);
+			}
+
+			kfree(p);
+		}
 	}
 
 	/* following loop may be a bit non-obvious, and so deserves some
