@@ -9,17 +9,17 @@
 #define DEDUP_ON 	1
 #define DEDUP_OFF 	0
 
-#define DEDUP_ALLOC_BOOTMEM_BSIZE (64000000)
+#define DEDUP_ALLOC_BOOTMEM_BSIZE (64000000)/*try this: 67108864*/
 
 #define DEDUP_BDEV_NAME "/dev/sda1"
 
 // Variables
 
 struct dedup_blk_info{
-	u8 **hashes;
-	struct page **pages;
-	u32 *hash_crc;
-	sector_t *equal_blocks;
+	u8 **hashes;				// sha256 of block data
+	struct page **pages;		// reference to block's page
+	u32 *hash_crc;				// crc value of block sha256
+	sector_t *equal_blocks;		// circular vector of equal blocks
 };
 
 // Functions
@@ -38,6 +38,7 @@ int dedup_wait_for_init(void);
 size_t dedup_get_block_size(void);
 struct page* dedup_get_block_page(sector_t nBlock);
 int dedup_is_in_range(sector_t block);
+int dedup_is_our_bdev(struct block_device *bdev);
 void dedup_update_block_page(struct page *page);
 
 // Count statistics

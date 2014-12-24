@@ -1810,32 +1810,36 @@ void generic_make_request(struct bio *bio)
 	}
 
 	if (!dedup_wait_for_init() && (bio->bi_rw & WRITE)) {
-		sector_t changed_block = (unsigned long long)bio->bi_sector >> 3;
 
-		// Check if the block is in our dedup range
-		if (dedup_is_in_range(changed_block)) {
-			int i=0;
-			struct bio_vec *bvec;
-			char *p = (char*)kmalloc(dedup_get_block_size(), GFP_KERNEL);
+		// Check if the page is accosiated with our block device
+		if (dedup_is_our_bdev(bio->bi_bdev)) {
 
-			printk("[%ld] [%llu] [%d] [%d] [%ld]\n",
-				bio->bi_sector,
-				(unsigned long long)bio->bi_sector >> 3,
-				bio_sectors(bio),
-				bio->bi_size,
-				bio_sector_offset(bio, bio_sectors(bio), 0));
+			sector_t changed_block = (unsigned long long)bio->bi_sector >> 3;
 
-			// Go over each bio and update its block new data hash and crc
-			bio_for_each_segment_all(bvec, bio, i) {
-				char *addr = page_address(bvec->bv_page);
-				int len = bvec->bv_len;
-				memcpy(p, addr + bvec->bv_offset, len);
+			// Check if the block is in our dedup range
+			if (dedup_is_in_range(changed_block)) {
+				int i=0;
+				struct bio_vec *bvec;
+				char *p = (char*)kmalloc(dedup_get_block_size(), GFP_KERNEL);
 
-				// TODO: use page_address instead of copying it - low priority
-				dedup_update_page_changed(changed_block + i, p);
+				printk("[%ld] [%llu] [%d] [%d] [%ld]\n",
+					bio->bi_sector,
+					(unsigned long long)bio->bi_sector >> 3,
+					bio_sectors(bio),
+					bio->bi_size,
+					bio_sector_offset(bio, bio_sectors(bio), 0));
+
+				// Go over each bio and update its block new data hash and crc
+				bio_for_each_segment_all(bvec, bio, i) {
+					char *addr = page_address(bvec->bv_page);
+					int len = bvec->bv_len;
+					memcpy(p, addr + bvec->bv_offset, len);
+					// TODO: use page_address instead of copying it - low priority
+					dedup_update_page_changed(changed_block + i, p);
+				}
+
+				kfree(p);
 			}
-
-			kfree(p);
 		}
 	}
 

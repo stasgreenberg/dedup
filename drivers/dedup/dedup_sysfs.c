@@ -17,19 +17,21 @@
 #include <linux/time.h>
 
 static struct kobject *stats_kobj;
-static int stats;
+//static int stats;
 static int collect_stats;
 
 static unsigned long start_block = 0; // From which block to start dedup (testing)
 static long blocks_count; // How much blocks compared
 static struct dedup_blk_info blocksArray;// = NULL; // Holds all data about blocks
+// TODO: define struct for all statistics
 static sector_t duplicatedBlocks; // Number of duplicated blocks
 
 static int need_to_init = 2;
-static char* bdev_name = NULL;
+static char* dedup_bdev_name = NULL;
+static int dedup_bdev_name_len = 0;
 static struct block_device *dedup_bdev = NULL;
 
-// max blocks to allocate, the maximus kmalloc can afford is 128k.
+// max blocks to allocate, the maximum kmalloc can afford is 128k.
 // This will be allocated by alloc_bootmem int start_kernel() init/main.c
 static const long BLOCKS_MAX_COUNT = (DEDUP_ALLOC_BOOTMEM_BSIZE / sizeof(u8*));
 
@@ -39,6 +41,7 @@ void print_dedup_data_structure(void);
 // -----------------------------------------------------------------
 
 int calc_hash(char* data, size_t size, u8* hash_out);
+struct block_device* get_our_bdev(void);
 
 void dedup_add_total_read(void) { ++total_read_count; }
 void dedup_add_equal_read(void) { ++equal_read_count; }
@@ -57,14 +60,42 @@ int dedup_is_in_range(sector_t block)
 }
 
 /*
+ * By comparing its bd_disk, check if bdev is the block device we use for dedup.
+ */
+int dedup_is_our_bdev(struct block_device *bdev)
+{
+	int res = 0;
+	static int last_print = 0;
+
+	if (bdev == NULL)
+		printk("bdev is NULL, cannot compare\n");
+	else
+	{
+		dedup_bdev = get_our_bdev();
+
+		if (dedup_bdev) {
+			if (bdev->bd_disk == dedup_bdev->bd_disk)
+				res = 1;
+
+			blkdev_put(dedup_bdev, FMODE_READ|FMODE_WRITE);
+			dedup_bdev = NULL;
+		}
+		else
+			printk("Failed to get our bdev form comparation\n");
+	}
+
+	return res;
+}
+
+/*
  * Will return a pointer to the block device, used for the dedup access.
- * The device is found by its name, configured in bdev_name.
+ * The device is found by its name, configured in dedup_bdev_name.
  * If there is no such device, NULL will be returned.
  */
 struct block_device* get_our_bdev(void)
 {
 	struct block_device *bdev =
-			lookup_bdev((bdev_name) ? bdev_name : DEDUP_BDEV_NAME);
+			lookup_bdev((dedup_bdev_name) ? dedup_bdev_name : DEDUP_BDEV_NAME);
 
 	return ((bdev == NULL) ?NULL : blkdev_get_by_dev(bdev->bd_dev, FMODE_READ|FMODE_WRITE, NULL));
 }
@@ -125,6 +156,7 @@ void read_block(char *dest, size_t size, sector_t block)
 static ssize_t stats_show(struct kobject *kobj, struct kobj_attribute *attr,
 						  char *buf)
 {
+	int stats = 0;
 	printk(KERN_ERR "**************************** STATS *****************************\n");
 	printk(KERN_ERR "total duplicated blocks = %ld\n", duplicatedBlocks);
 	printk(KERN_ERR "equal read = %ld\n", equal_read_count);
@@ -178,6 +210,8 @@ void print_block(int block_num)
 
 	if (!curr_data)	{
 		printk("Failed to kmalloc buf to store block data.\n");
+		blkdev_put(dedup_bdev, FMODE_READ|FMODE_WRITE);
+		dedup_bdev = NULL;
 		return;
 	}
 
@@ -194,16 +228,16 @@ void print_block(int block_num)
 /*
 * Input help function, used to handle several commands:
 * 'block 12345' sets start block to be 12345.
-* 'block comp' sets comp_on to be 1 thus performs blocks compare.
-* 'block hash' sets comp_on to be 0.
+* 'setbd /dev/sda2' sets the block device to work on
 * 'dedup 12' performs blocks read and compare on 12 blocks starting from start_block.
+* 'print 123' prints block 123 content
+* 'print tree' prints all dedup structure
 */
 long check_input(const char *buffer)
 {
 	char dedup[] = "dedup";
   	char op[] = "2147483647";			/* max int */
 	char end;
-	int name_len;
 	long n = -2;
 	int params = sscanf (buffer,"%5s %10s %c", dedup, op, &end);
 
@@ -233,17 +267,19 @@ long check_input(const char *buffer)
 				n = -2;
 		}
 		else if (strncmp ("setbd", dedup, 5) == 0) {
-			kfree(bdev_name);
+			kfree(dedup_bdev_name);
 
-			name_len = strlen(op);
-			bdev_name = kmalloc(name_len, GFP_KERNEL);
-			if (!bdev_name) {
-				printk("bdev_name allocation failed.\n");
+			dedup_bdev_name_len = strlen(op);
+			// +1 for \0
+			dedup_bdev_name = kmalloc(dedup_bdev_name_len + 1, GFP_KERNEL);
+			if (!dedup_bdev_name) {
+				printk("dedup_bdev_name allocation failed.\n");
 				return -2;
 			}
 
-			memcpy(bdev_name, op, name_len);
-			printk("bdev_name = %s, len = %d.\n", bdev_name, name_len);
+			memcpy(dedup_bdev_name, op, dedup_bdev_name_len);
+			dedup_bdev_name[dedup_bdev_name_len] = 0;
+			printk("dedup_bdev_name = %s, len = %d.\n", dedup_bdev_name, dedup_bdev_name_len);
 			n = -1;
 		}
 		else if (strncmp ("print", dedup, 5) == 0) {
@@ -256,6 +292,11 @@ long check_input(const char *buffer)
 			else if (strncmp ("tree", op, 4) == 0) {
 				/* print tree command */
 				print_dedup_data_structure();
+				n = -1;
+			}
+			else if (strncmp ("bdev", op, 4) == 0) {
+				/* print block device name command */
+				printk("dedup_bdev_name = %s, len = %d.\n", dedup_bdev_name, dedup_bdev_name_len);
 				n = -1;
 			}
 			else
@@ -289,7 +330,7 @@ static ssize_t stats_store(struct kobject *kobj, struct kobj_attribute *attr,
 	else if (result == 0) {
 		// Turn dedup OFF
 		printk(KERN_ERR "\n-------\n- Off -\n-------\n");
-		collect_stats = DEDUP_ON;
+		collect_stats = DEDUP_OFF;
 	}
 	else if (result == -1) {
 		// Some parameter was changed
@@ -310,7 +351,6 @@ static struct attribute *attrs[] = {
     &stats_attribute.attr,
     NULL,
 };
- 
 
 static struct attribute_group attr_group = {
     .attrs = attrs,
@@ -392,7 +432,7 @@ int dedup_calc(void)
 			blocks_count = BLOCKS_MAX_COUNT;
 
 		printk(KERN_ERR "blocks count = %ld (max = %ld)\n", blocks_count, BLOCKS_MAX_COUNT);
-		printk(KERN_ERR "each block logical size is (%ld)\n", dedup_get_block_size());
+		printk(KERN_ERR "each block size is (%ld)\n", dedup_get_block_size());
 
 		// Initialize block structure
 		if (dedup_init_blocks()) {
@@ -537,7 +577,7 @@ int dedup_init_blocks(void)
 		blocksArray.pages[block_idx] = NULL;
 		blocksArray.hashes[block_idx] = NULL;
 
-		// READ AND HASH BLOCKS BEFORE COMPARATION
+		// allocate hash array and init crc
 		blocksArray.hashes[block_idx] = (u8*)kmalloc(SHA256_DIGEST_SIZE, GFP_KERNEL);
 		blocksArray.hash_crc[block_idx] = 0;
 

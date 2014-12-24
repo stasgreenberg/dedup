@@ -355,57 +355,80 @@ int dedup_alloc_and_copy_page(struct page* p1, sector_t block1, struct page* p2)
 }
 
 /**
- *
+ * This function will try to spare read operation from block device
+ * by looking for a cached page contains equal data.
+ * Each page may contain several blocks, so we need to go over all requested
+ * blocks and check if there is an equal block inside a cached page.
+ * If and equal block found and the associated page is cached right now,
+ * we will copy the relevant data.
  */
 int dedup_get_duplicated_page(struct page *page)
 {
 	int ret = 0;
 	struct page *duplicated_page;
-	sector_t block_offset_in_page, curr_block;
+	sector_t block_offset_in_page, next_equal_block;
 	sector_t *blocks;
 	int nr_blocks;
 
+	// Check if the page is accosiated with our block device
+	if (!dedup_is_our_bdev(I_BDEV(page->mapping->host))) {
+		goto done_dedup;
+	}
+
+	// Get requested blocks
+	// Todo: for now, we assume block size equals page size
 	blocks = dedup_get_page_physical_blocks(page, &nr_blocks);
 	if (!blocks)
 		goto done_dedup;
 
 	// Todo: add support if there is more than 1 block in page - check them all
+	// Check if the requested blocks are inside our dedup range
 	if (dedup_is_in_range(blocks[0]))
 		// Used for statistics - counts total reads
 		dedup_add_total_read();
 	else
 		goto done_dedup;
 
+	// Get next equal block of first requested block
 	block_offset_in_page = 0;
-	curr_block = dedup_get_next_equal_block(blocks[block_offset_in_page]);
-	if (curr_block == blocks[block_offset_in_page])
+	next_equal_block = dedup_get_next_equal_block(blocks[block_offset_in_page]);
+	if (next_equal_block == blocks[block_offset_in_page])
+		// No equal block...
 		goto done_dedup;
 
-	// Check first if the same block already read from device
+	// Lets get all blocks from cache (if exist)
 	do {
-		duplicated_page = dedup_get_block_page(curr_block);
+		// try to get block's page in cache, need to call put_page before leaving
+		duplicated_page = dedup_get_block_page(next_equal_block);
 
 		// Check if we found the page should contain the duplicated block
 		if (duplicated_page) {
 			// TODO: we need to copy page content to avoid read from bdev
 			dedup_alloc_and_copy_page(page, blocks[block_offset_in_page], duplicated_page);
 
+			// block was copied, continue to the next one (if there is...)
 			block_offset_in_page++;
 			if (block_offset_in_page < nr_blocks) {
-				curr_block = dedup_get_next_equal_block(blocks[block_offset_in_page]);
+				// Todo: add support for more than 1 block in page
+				BUG_ON(1);
+				next_equal_block = dedup_get_next_equal_block(blocks[block_offset_in_page]);
 			}
 		}
 		else {
 			// Try next duplicated block
-			curr_block = dedup_get_next_equal_block(curr_block);
+			next_equal_block = dedup_get_next_equal_block(next_equal_block);
 		}
 
+		// Check if the page was cached
 		if  (duplicated_page) {
+			// We must call page_put because we used page_get inside dedup_get_block_page
 			page_cache_release(duplicated_page);
 		}
-	} while ((curr_block != blocks[block_offset_in_page]) &&
+	// Loop until we got all blocks
+	} while ((next_equal_block != blocks[block_offset_in_page]) &&
 			block_offset_in_page < nr_blocks);
 
+	// did we get all blocks
 	if (block_offset_in_page == nr_blocks) {
 		dedup_add_equal_read();
 		//ret = 1;
@@ -484,7 +507,8 @@ mpage_readpages(struct address_space *mapping, struct list_head *pages,
 						&last_block_in_bio, &map_bh,
 						&first_logical_block,
 						get_block);
-				dedup_update_block_page(page);
+				if (!dedup_wait_for_init())
+					dedup_update_block_page(page);
 			}
 			else
 			{
@@ -513,8 +537,13 @@ int mpage_readpage(struct page *page, get_block_t get_block)
 
 	map_bh.b_state = 0;
 	map_bh.b_size = 0;
-	bio = do_mpage_readpage(bio, page, 1, &last_block_in_bio,
-			&map_bh, &first_logical_block, get_block);
+
+	// Check if dedup structure is not ready or duplicated page was not found
+	if (dedup_wait_for_init() || !dedup_get_duplicated_page(page)) {
+		bio = do_mpage_readpage(bio, page, 1, &last_block_in_bio,
+				&map_bh, &first_logical_block, get_block);
+	}
+
 	if (bio)
 		mpage_bio_submit(READ, bio);
 	return 0;
