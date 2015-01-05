@@ -15,6 +15,7 @@
 #include <linux/delay.h>
 #include <linux/crc32.h>
 #include <linux/time.h>
+#include <linux/kdev_t.h>
 
 static struct kobject *stats_kobj;
 //static int stats;
@@ -28,6 +29,9 @@ static sector_t duplicatedBlocks; // Number of duplicated blocks
 
 static int need_to_init = 2;
 static char* dedup_bdev_name = NULL;
+// Used for bdev compare, encoded value using MAJOR MINOR
+static u32 our_bdev_id = 0;
+
 static int dedup_bdev_name_len = 0;
 static struct block_device *dedup_bdev = NULL;
 
@@ -60,29 +64,17 @@ int dedup_is_in_range(sector_t block)
 }
 
 /*
- * By comparing its bd_disk, check if bdev is the block device we use for dedup.
+ * Check if bdev is the block device we use for dedup.
+ * Compare block device's encode value using MAJOR MINOR.
  */
 int dedup_is_our_bdev(struct block_device *bdev)
 {
 	int res = 0;
-	static int last_print = 0;
 
 	if (bdev == NULL)
 		printk("bdev is NULL, cannot compare\n");
-	else
-	{
-		dedup_bdev = get_our_bdev();
-
-		if (dedup_bdev) {
-			if (bdev->bd_disk == dedup_bdev->bd_disk)
-				res = 1;
-
-			blkdev_put(dedup_bdev, FMODE_READ|FMODE_WRITE);
-			dedup_bdev = NULL;
-		}
-		else
-			printk("Failed to get our bdev form comparation\n");
-	}
+	else if (new_encode_dev(bdev->bd_dev) == our_bdev_id)
+		res = 1;
 
 	return res;
 }
@@ -303,6 +295,23 @@ long check_input(const char *buffer)
 				/* invalid input */
 				n = -2;
 		}
+		else if (strncmp ("count", dedup, 5) == 0) {
+			if (sscanf (op, "%ld", &n) == 1) {
+				long int i = 0, count = 0;
+				printk("%ld -> %ld\n", n*1000, (n+1)*1000);
+				for (i = n*1000; 
+					 (i < blocks_count) && (i < ((n+1)*1000)); 
+					++i){
+					if (blocksArray.equal_blocks[i] != i) {
+						++count;
+						printk("%ld-%ld ", i+start_block, blocksArray.equal_blocks[i]+start_block);
+					}
+				}
+
+				printk("\ntotal duplicated block: %ld\n", count);
+				n = -1;
+			}
+		}
 	}
 
 	return n;
@@ -427,6 +436,13 @@ int dedup_calc(void)
 			printk(KERN_ERR "get bdev failed.\n");
 			return -1;
 		}
+
+		// Update our gendisk pointer
+		our_bdev_id = new_encode_dev(dedup_bdev->bd_dev);
+
+		printk("****************** our bdev id *****************\n");
+		printk("dev id=%d\n", our_bdev_id);
+		printk("************************************************\n");
 
 		if (blocks_count > BLOCKS_MAX_COUNT)
 			blocks_count = BLOCKS_MAX_COUNT;
@@ -624,7 +640,7 @@ int dedup_wait_for_init(void) { return need_to_init; }
  */
 void print_dedup_data_structure(void)
 {
-	int i, j;
+	long i, j;
 	// Init array used to indicate if we already printed this link
 	char* tmp_buf = (char *)kmalloc(blocks_count, GFP_KERNEL);
 	if (!tmp_buf) {
@@ -645,13 +661,16 @@ void print_dedup_data_structure(void)
 				// Ignore blocks that do not have equal blocks
 				continue;
 
-			printk("%d", i);
+			printk("%ld", i + start_block);
 
 			// Loop all equal blocks
-			while (j != i && tmp_buf[j]){
-				// Make sure it will not be printed next time
-				tmp_buf[j] = 0;
-				printk("->%d", j);
+			while (j != i){
+				if (tmp_buf[j]){
+					// Make sure it will not be printed next time
+					tmp_buf[j] = 0;
+					printk("->%ld", j + start_block);
+				}
+
 				j = blocksArray.equal_blocks[j];
 			}
 

@@ -367,11 +367,11 @@ int dedup_get_duplicated_page(struct page *page)
 	int ret = 0;
 	struct page *duplicated_page;
 	sector_t block_offset_in_page, next_equal_block;
-	sector_t *blocks;
+	sector_t *blocks = NULL;
 	int nr_blocks;
 
-	// Check if the page is accosiated with our block device
-	if (!dedup_is_our_bdev(I_BDEV(page->mapping->host))) {
+	// Check if the page is associated with our block device
+	if (!dedup_is_our_bdev(page->mapping->host->i_sb->s_bdev)) {
 		goto done_dedup;
 	}
 
