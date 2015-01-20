@@ -381,6 +381,9 @@ int dedup_get_duplicated_page(struct page *page)
 	if (!blocks)
 		goto done_dedup;
 
+	if (nr_blocks > 1)
+		printk("nr_blocks is more than 1 8-O !\n");
+
 	// Todo: add support if there is more than 1 block in page - check them all
 	// Check if the requested blocks are inside our dedup range
 	if (dedup_is_in_range(blocks[0]))
@@ -431,7 +434,6 @@ int dedup_get_duplicated_page(struct page *page)
 	// did we get all blocks
 	if (block_offset_in_page == nr_blocks) {
 		dedup_add_equal_read();
-		//ret = 1;
 	}
 done_dedup:
 	if (blocks)

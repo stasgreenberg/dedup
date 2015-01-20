@@ -18,11 +18,20 @@
 #include <linux/kdev_t.h>
 
 static struct kobject *stats_kobj;
-//static int stats;
 static int collect_stats;
 
 static unsigned long start_block = 0; // From which block to start dedup (testing)
 static long blocks_count; // How much blocks compared
+
+// Used to handle non continuous dedup range
+typedef struct {
+    long start;
+    long end;
+} BlocksRange;
+
+BlocksRange *arrOurBlocks = NULL; // Will contain dedup ranges
+int nRangesCount = 0;
+
 static struct dedup_blk_info blocksArray;// = NULL; // Holds all data about blocks
 // TODO: define struct for all statistics
 static sector_t duplicatedBlocks; // Number of duplicated blocks
@@ -54,6 +63,28 @@ void dedup_add_equal_read(void) { ++equal_read_count; }
  * Checks if the block is inside our dedup range
  * return 1 if the block is in range
  */
+
+int dedup_is_in_range(sector_t block)
+{
+	int bInRange = 0, i;
+
+	if ((block >= start_block)  && (block < (start_block + blocks_count))) {
+		for (i = 0; i < nRangesCount; ++i)
+		{
+			if (block >= arrOurBlocks[i].start &&
+				block <= arrOurBlocks[i].end)
+			{
+				// in range
+				bInRange = 1;
+				break;
+			}
+		}
+	}
+
+	return bInRange;
+}
+// old one
+/*
 int dedup_is_in_range(sector_t block)
 {
 	int res = 0;
@@ -61,7 +92,7 @@ int dedup_is_in_range(sector_t block)
 		res = 1;
 
 	return res;
-}
+}*/
 
 /*
  * Check if bdev is the block device we use for dedup.
@@ -169,13 +200,13 @@ size_t dedup_get_block_size(void)
 		// Get block device
 		dedup_bdev = get_our_bdev();
 		// Get block size
-		block_size = dedup_bdev->bd_block_size;//bdev_logical_block_size(dedup_bdev);
+		block_size = dedup_bdev->bd_block_size;
 		// Release block device
 		blkdev_put(dedup_bdev, FMODE_READ|FMODE_WRITE);
 		dedup_bdev = NULL;
 	}
 	else
-		block_size = dedup_bdev->bd_block_size;//bdev_logical_block_size(dedup_bdev);
+		block_size = dedup_bdev->bd_block_size;
 
 	return block_size;
 }
@@ -229,11 +260,12 @@ long check_input(const char *buffer)
 {
 	char dedup[] = "dedup";
   	char op[] = "2147483647";			/* max int */
-	char end;
+  	char op2[] = "2147483647";			/* max int */
+	//char end;
 	long n = -2;
-	int params = sscanf (buffer,"%5s %10s %c", dedup, op, &end);
+	int params = sscanf (buffer,"%5s %10s %10s", dedup, op, op2);
 
-	if (params == 2) {
+	if (params >= 2) {
 		if (strncmp ("dedup", dedup, 5) == 0) {
 			if (strncmp ("off", op, 3) == 0) {
 				/* stop command */
@@ -291,6 +323,12 @@ long check_input(const char *buffer)
 				printk("dedup_bdev_name = %s, len = %d.\n", dedup_bdev_name, dedup_bdev_name_len);
 				n = -1;
 			}
+			else if (strncmp ("ranges", op, 6) == 0) {
+				int i;
+				for (i = 0; i < nRangesCount; ++i)
+					printk("%ld-%ld\n", arrOurBlocks[i].start, arrOurBlocks[i].end);
+				n = -1;
+			}
 			else
 				/* invalid input */
 				n = -2;
@@ -310,6 +348,31 @@ long check_input(const char *buffer)
 
 				printk("\ntotal duplicated block: %ld\n", count);
 				n = -1;
+			}
+		}
+		else if (strncmp ("range", dedup, 5) == 0) {
+			long start, end;
+			if (sscanf (op, "%ld", &start) == 1 &&
+				sscanf (op2, "%ld", &end) == 1) {
+				int i;
+				// add new range
+				// allocate new
+				BlocksRange *arrNewRanges =
+					kmalloc((nRangesCount + 1) * sizeof(BlocksRange), GFP_KERNEL);
+				if (arrOurBlocks) {
+					// copy old
+					for (i = 0; i < nRangesCount; ++i)
+						arrNewRanges[i] = arrOurBlocks[i];
+					kfree(arrOurBlocks);
+				}
+				// add new
+				arrNewRanges[nRangesCount].start = start;
+				arrNewRanges[nRangesCount].end = end;
+				++nRangesCount;
+				// set as current
+				arrOurBlocks = arrNewRanges;
+				n = -1;
+				printk("adding range %ld-%ld\n", start, end);
 			}
 		}
 	}
@@ -479,6 +542,7 @@ int dedup_update_page_changed(sector_t block, char* block_data)
 	sector_t currblock, equal_block;
 
 	// Todo: add support if there is more than 1 block in page - check them all
+	// Check if block in dedup range
 	if (!dedup_is_in_range(block)) {
 		trace_printk("block not in range %ld", block);
 		return 0;
@@ -500,6 +564,9 @@ int dedup_update_page_changed(sector_t block, char* block_data)
 	for (currblock = 0; currblock < blocks_count; ++currblock) {
 		// If blocks equal, update dedup structure
 		if (currblock != block) {
+			if (blocksArray.hashes[currblock] == NULL)
+				continue;
+
 			// first, compare crc - should be faster
 			if (blocksArray.hash_crc[currblock] == blocksArray.hash_crc[block]){
 				// If hash array is NULL then there is a block at lower index
@@ -554,6 +621,9 @@ void test_final_hash_compare(void)
 	// Go over all blocks
 	for (i = 0; i < blocks_count; ++i) {
 		equal_block = i;
+		if (blocksArray.hashes[i] == NULL)
+			continue;
+
 		// Loop until current block
 		for (j = 0; j < i; ++j) {
 			// first, compare crc - should be faster
@@ -594,20 +664,23 @@ int dedup_init_blocks(void)
 		blocksArray.hashes[block_idx] = NULL;
 
 		// allocate hash array and init crc
-		blocksArray.hashes[block_idx] = (u8*)kmalloc(SHA256_DIGEST_SIZE, GFP_KERNEL);
-		blocksArray.hash_crc[block_idx] = 0;
+		if (dedup_is_in_range(block_idx + start_block)) {
+			blocksArray.hashes[block_idx] = (u8*)kmalloc(SHA256_DIGEST_SIZE, GFP_KERNEL);
+			blocksArray.hash_crc[block_idx] = 0;
 
-		if (blocksArray.hashes[block_idx] == NULL) {
-			printk(KERN_ERR "failed to alloc hash buffer.\n");
-			return -1;
+			if (blocksArray.hashes[block_idx] == NULL) {
+				printk(KERN_ERR "failed to alloc hash buffer.\n");
+				return -1;
+			}
 		}
 	}
 
 	printk(KERN_ERR "Looking for equal blocks.\n");
 	// Go over all block set equal
 	for (block_idx = 0; block_idx < blocks_count; ++block_idx) {
-		// Find equal block
-		dedup_calc_block_hash_crc(block_idx);
+		if (blocksArray.hashes[block_idx] != NULL)
+			// Find equal block
+			dedup_calc_block_hash_crc(block_idx);
 
 		if (block_idx == next_status_block) {
 			next_status_block += status_update_step;
@@ -702,27 +775,30 @@ sector_t dedup_get_next_equal_block(sector_t block)
  */
 void dedup_calc_block_hash_crc(sector_t block)
 {
-	size_t block_size = dedup_get_block_size();
-	char *block_data;
+	// Check if block in dedup range
+	if (blocksArray.hashes[block] != NULL) {
+		size_t block_size = dedup_get_block_size();
+		char *block_data;
 
-	if (block >= blocks_count)
-		// outside dedup range
-		return;
+		if (block >= blocks_count)
+			// outside dedup range
+			return;
 
-	block_data = (char*)kmalloc(block_size, GFP_KERNEL);
-	if (block_data == NULL) {
-		printk(KERN_ERR "failed allocating block data buffer.\n");
-		return;
+		block_data = (char*)kmalloc(block_size, GFP_KERNEL);
+		if (block_data == NULL) {
+			printk(KERN_ERR "failed allocating block data buffer.\n");
+			return;
+		}
+
+		// Read block
+		read_block(block_data, block_size, start_block + block);
+		// Calc hash
+		calc_hash(block_data, block_size, blocksArray.hashes[block]);
+		// Calc crc32
+		blocksArray.hash_crc[block] = crc32_le(0, blocksArray.hashes[block], SHA256_DIGEST_SIZE);
+
+		kfree(block_data);
 	}
-
-	// Read block
-	read_block(block_data, block_size, start_block + block);
-	// Calc hash
-	calc_hash(block_data, block_size, blocksArray.hashes[block]);
-	// Calc crc32
-	blocksArray.hash_crc[block] = crc32_le(0, blocksArray.hashes[block], SHA256_DIGEST_SIZE);
-
-	kfree(block_data);
 }
 
 /*
